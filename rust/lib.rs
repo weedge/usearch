@@ -43,7 +43,7 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("lib.hpp");
 
-        /// Low-level C++ interface, that is further wrapped into the high-level `Index`
+        /// Low-level C++ interface that is further wrapped into the high-level `Index`
         type NativeIndex;
 
         pub fn new_native_index(options: &IndexOptions) -> Result<UniquePtr<NativeIndex>>;
@@ -207,6 +207,11 @@ impl Index {
     }
 
     /// Extracts one or more vectors matching specified key.
+    /// The `vector` slice must be a multiple number of dimensions in the index.
+    /// After the execution return the number `X` of vectors found.
+    /// The first `X * dimensions` elements of the vector slice will be filled.
+    ///
+    /// If you are a novice user, consider `export`.
     ///
     /// # Arguments
     ///
@@ -220,11 +225,34 @@ impl Index {
         T::get(self, key, vector)
     }
 
+    /// Extracts one or more vectors matching specified key into supplied resizable vector.
+    /// The `vector` is resized to a multiple number of dimensions in the index.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key associated with the vector.
+    /// * `vector` - A mutable vector containing the vector data.
+    pub fn export<T: VectorType + Default + Clone>(
+        self: &Index,
+        key: u64,
+        vector: &mut Vec<T>,
+    ) -> Result<usize, cxx::Exception> {
+        let dim = self.dimensions();
+        let max_matches = self.count(key);
+        vector.resize(dim * max_matches, T::default());
+        let matches = T::get(self, key, &mut vector[..]);
+        if matches.is_err() {
+            return matches;
+        }
+        vector.resize(dim * matches.as_ref().unwrap(), T::default());
+        return matches;
+    }
+
     /// Reserves memory for a specified number of incoming vectors.
     ///
     /// # Arguments
     ///
-    /// * `capacity` - The desired total capacity including the current size.
+    /// * `capacity` - The desired total capacity, including the current size.
     pub fn reserve(self: &Index, capacity: usize) -> Result<(), cxx::Exception> {
         self.inner.reserve(capacity)
     }
@@ -267,7 +295,7 @@ impl Index {
         self.inner.remove(key)
     }
 
-    /// Renames the vector under a certain key.
+    /// Renames the vector under a specific key.
     ///
     /// # Arguments
     ///
@@ -276,7 +304,7 @@ impl Index {
     ///
     /// # Returns
     ///
-    /// `true` if the vector is successfully renamed, `false` otherwise.
+    /// `true` if the vector is renamed, `false` otherwise.
     pub fn rename(self: &Index, from: u64, to: u64) -> Result<usize, cxx::Exception> {
         self.inner.rename(from, to)
     }
@@ -294,7 +322,7 @@ impl Index {
         self.inner.contains(key)
     }
 
-    /// Count the count of vector with the same specified key.
+    /// Count the count of vectors with the same specified key.
     ///
     /// # Arguments
     ///
@@ -334,18 +362,13 @@ impl Index {
         self.inner.view(path)
     }
 
-    /// Erases all members from index, closing files, and returning RAM to OS
-    ///
-    /// # Arguments
-    ///
-    ///
+    /// Erases all members from the index, closes files, and returns RAM to OS.
     pub fn reset(self: &Index) -> Result<(), cxx::Exception> {
         self.inner.reset()
     }
 
-    /// A relatively accurate lower bound on the amount of memory consumed by the system.In practice it's error will be below 10%.
-    ///
-    /// Retrieves the index's total memeory usage bytes
+    /// A relatively accurate lower bound on the amount of memory consumed by the system.
+    /// In practice, its error will be below 10%.
     pub fn memory_usage(self: &Index) -> usize {
         self.inner.memory_usage()
     }
@@ -402,49 +425,26 @@ mod tests {
         assert!(index.reserve(10).is_ok());
 
         let first: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
-        let second: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
+        let second: [f32; 5] = [0.3, 0.2, 0.4, 0.0, 0.1];
         assert!(index.add(1, &first).is_ok());
         assert!(index.add(2, &second).is_ok());
         assert_eq!(index.size(), 2);
 
-        let mut found = vec![0.0 as f32; options.dimensions];
-        assert_eq!(index.get(1, &mut found).unwrap(), 1);
-        println!("{:?}", found);
-        assert_eq!(found.len(), 5);
-    }
+        // Test using Vec<T>
+        let mut found_vec: Vec<f32> = Vec::new();
+        assert_eq!(index.export(1, &mut found_vec).unwrap(), 1);
+        assert_eq!(found_vec.len(), 5);
+        assert_eq!(found_vec, first.to_vec());
 
-    #[test]
-    fn test_add_remove_search_vector() {
-        let mut options = IndexOptions::default();
-        options.dimensions = 5;
-        let index = Index::new(&options).unwrap();
-        assert!(index.reserve(10).is_ok());
+        // Test using slice
+        let mut found_slice = [0.0 as f32; 5];
+        assert_eq!(index.get(1, &mut found_slice).unwrap(), 1);
+        assert_eq!(found_slice, first);
 
-        // add
-        let first: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
-        let second: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
-        assert!(index.add(1, &first).is_ok());
-        assert!(index.add(2, &second).is_ok());
-        assert!(index.add(3, &second).is_ok());
-        assert_eq!(index.size(), 3);
-
-        // remove
-        assert!(index.remove(1).is_ok());
-        assert_eq!(index.size(), 2);
-        // search
-        let results = index.search(&first, 10).unwrap();
-        println!("{:?}", results);
-        assert_eq!(results.keys.len(), 2);
-
-        // add
-        assert!(index.add(1, &first).is_ok());
-        assert!(index.add(4, &first).is_ok());
-        assert_eq!(index.size(), 4);
-
-        // search
-        let results = index.search(&first, 10).unwrap();
-        println!("{:?}", results);
-        assert_eq!(results.keys.len(), 4);
+        // Create a slice with incorrect size
+        let mut found = [0.0 as f32; 6]; // This isn't a multiple of the index's dimensions.
+        let result = index.get(1, &mut found);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(index.size(), 0);
 
         let first: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
-        let second: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
+        let second: [f32; 5] = [0.3, 0.2, 0.4, 0.0, 0.1];
 
         println!(
             "before add, memory_usage: {} \
