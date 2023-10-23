@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.1)
 project(
     usearch
-    VERSION 0.6.0
+    VERSION 2.7.2
     LANGUAGES C CXX
 )
 
@@ -134,7 +134,7 @@ endif ()
 
 # Set default build type to Release
 if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif ()
 
 # Include directories
@@ -205,6 +205,8 @@ function (setup_target TARGET_NAME)
                     -fPIC
                     -pedantic
                     -Wfatal-errors
+                    # Don't complain if the for-loops were not vectorzied
+                    -Wpass-failed=transform-warning
                     -fcolor-diagnostics
                     -ftime-trace
         )

@@ -1,6 +1,7 @@
 #[cxx::bridge]
 pub mod ffi {
     // Shared structs with fields visible to both languages.
+    #[derive(Debug)]
     struct Matches {
         keys: Vec<u64>,
         distances: Vec<f32>,
@@ -44,6 +45,11 @@ pub mod ffi {
 
         /// Low-level C++ interface that is further wrapped into the high-level `Index`
         type NativeIndex;
+
+        pub fn expansion_add(self: &NativeIndex) -> usize;
+        pub fn expansion_search(self: &NativeIndex) -> usize;
+        pub fn change_expansion_add(self: &NativeIndex, n: usize) -> Result<()>;
+        pub fn change_expansion_search(self: &NativeIndex, n: usize) -> Result<()>;
 
         pub fn new_native_index(options: &IndexOptions) -> Result<UniquePtr<NativeIndex>>;
         pub fn reserve(self: &NativeIndex, capacity: usize) -> Result<()>;
@@ -175,6 +181,26 @@ impl Index {
         }
     }
 
+    /// Retrieves the expansion value used during index creation.
+    pub fn expansion_add(self: &Index) -> usize {
+        self.inner.expansion_add()
+    }
+
+    /// Retrieves the expansion value used during search.
+    pub fn expansion_search(self: &Index) -> usize {
+        self.inner.expansion_search()
+    }
+
+    /// Updates the expansion value used during index creation. Rarely used.
+    pub fn change_expansion_add(self: &Index, n: usize) -> Result<(), cxx::Exception> {
+        self.inner.change_expansion_add(n)
+    }
+
+    /// Updates the expansion value used during search operations.
+    pub fn change_expansion_search(self: &Index, n: usize) -> Result<(), cxx::Exception> {
+        self.inner.change_expansion_search(n)
+    }
+
     /// Performs k-Approximate Nearest Neighbors (kANN) Search for closest vectors to the provided query.
     ///
     /// # Arguments
@@ -204,6 +230,11 @@ impl Index {
     }
 
     /// Extracts one or more vectors matching the specified key.
+    /// The `vector` slice must be a multiple of the number of dimensions in the index.
+    /// After the execution, return the number `X` of vectors found.
+    /// The vector slice's first `X * dimensions` elements will be filled.
+    ///
+    /// If you are a novice user, consider `export`.
     ///
     /// # Arguments
     ///
@@ -215,6 +246,29 @@ impl Index {
         vector: &mut [T],
     ) -> Result<usize, cxx::Exception> {
         T::get(self, key, vector)
+    }
+
+    /// Extracts one or more vectors matching specified key into supplied resizable vector.
+    /// The `vector` is resized to a multiple of the number of dimensions in the index.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key associated with the vector.
+    /// * `vector` - A mutable vector containing the vector data.
+    pub fn export<T: VectorType + Default + Clone>(
+        self: &Index,
+        key: u64,
+        vector: &mut Vec<T>,
+    ) -> Result<usize, cxx::Exception> {
+        let dim = self.dimensions();
+        let max_matches = self.count(key);
+        vector.resize(dim * max_matches, T::default());
+        let matches = T::get(self, key, &mut vector[..]);
+        if matches.is_err() {
+            return matches;
+        }
+        vector.resize(dim * matches.as_ref().unwrap(), T::default());
+        return matches;
     }
 
     /// Reserves memory for a specified number of incoming vectors.
@@ -336,7 +390,7 @@ impl Index {
         self.inner.reset()
     }
 
-    /// A relatively accurate lower bound on the amount of memory consumed by the system. 
+    /// A relatively accurate lower bound on the amount of memory consumed by the system.
     /// In practice, its error will be below 10%.
     pub fn memory_usage(self: &Index) -> usize {
         self.inner.memory_usage()
@@ -378,9 +432,85 @@ pub fn new_index(options: &ffi::IndexOptions) -> Result<Index, cxx::Exception> {
 mod tests {
     use crate::ffi::IndexOptions;
     use crate::ffi::MetricKind;
+    use crate::ffi::ScalarKind;
 
     use crate::new_index;
     use crate::Index;
+
+    #[test]
+    fn test_add_get_vector() {
+        let mut options = IndexOptions::default();
+        options.dimensions = 5;
+        let index = Index::new(&options).unwrap();
+        assert!(index.reserve(10).is_ok());
+
+        let first: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
+        let second: [f32; 5] = [0.3, 0.2, 0.4, 0.0, 0.1];
+        assert!(index.add(1, &first).is_ok());
+        assert!(index.add(2, &second).is_ok());
+        assert_eq!(index.size(), 2);
+
+        // Test using Vec<T>
+        let mut found_vec: Vec<f32> = Vec::new();
+        assert_eq!(index.export(1, &mut found_vec).unwrap(), 1);
+        assert_eq!(found_vec.len(), 5);
+        assert_eq!(found_vec, first.to_vec());
+
+        // Test using slice
+        let mut found_slice = [0.0 as f32; 5];
+        assert_eq!(index.get(1, &mut found_slice).unwrap(), 1);
+        assert_eq!(found_slice, first);
+
+        // Create a slice with incorrect size
+        let mut found = [0.0 as f32; 6]; // This isn't a multiple of the index's dimensions.
+        let result = index.get(1, &mut found);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_remove_vector() {
+        let mut options = IndexOptions::default();
+        options.dimensions = 4;
+        options.metric = MetricKind::IP;
+        options.quantization = ScalarKind::F64;
+        options.connectivity = 10;
+        options.expansion_add = 128;
+        options.expansion_search = 3;
+        let index = Index::new(&options).unwrap();
+        assert!(index.reserve(10).is_ok());
+        assert_eq!(index.capacity(), 10);
+
+        let first: [f32; 4] = [0.2, 0.1, 0.2, 0.1];
+        let second: [f32; 4] = [0.3, 0.2, 0.4, 0.0];
+
+        // IDs until 18446744073709551615 are fine:
+        let id1 = 483367403120493160;
+        let id2 = 483367403120558696;
+        let id3 = 483367403120624232;
+        let id4 = 4; // 483367403120624233;
+
+        assert!(index.add(id1, &first).is_ok());
+        let mut found_slice = [0.0 as f32; 4];
+        assert_eq!(index.get(id1, &mut found_slice).unwrap(), 1);
+        assert!(index.remove(id1).is_ok());
+    
+        assert!(index.add(id2, &second).is_ok());
+        let mut found_slice = [0.0 as f32; 4];
+        assert_eq!(index.get(id2, &mut found_slice).unwrap(), 1);
+        assert!(index.remove(id2).is_ok());
+        
+        assert!(index.add(id3, &second).is_ok());
+        let mut found_slice = [0.0 as f32; 4];
+        assert_eq!(index.get(id3, &mut found_slice).unwrap(), 1);
+        assert!(index.remove(id3).is_ok());
+                
+        assert!(index.add(id4, &second).is_ok());
+        let mut found_slice = [0.0 as f32; 4];
+        assert_eq!(index.get(id4, &mut found_slice).unwrap(), 1);
+        assert!(index.remove(id4).is_ok());
+
+        assert_eq!(index.size(), 0);
+    }
 
     #[test]
     fn integration() {
@@ -395,6 +525,9 @@ mod tests {
 
         let index = Index::new(&options).unwrap();
 
+        assert!(index.expansion_add() > 0);
+        assert!(index.expansion_search() > 0);
+
         assert!(index.reserve(10).is_ok());
         assert!(index.capacity() >= 10);
         assert!(index.connectivity() != 0);
@@ -402,7 +535,7 @@ mod tests {
         assert_eq!(index.size(), 0);
 
         let first: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
-        let second: [f32; 5] = [0.2, 0.1, 0.2, 0.1, 0.3];
+        let second: [f32; 5] = [0.3, 0.2, 0.4, 0.0, 0.1];
 
         println!(
             "before add, memory_usage: {} \
@@ -411,7 +544,11 @@ mod tests {
             index.memory_usage(),
             index.capacity(),
         );
+        assert!(index.change_expansion_add(10).is_ok());
+        assert_eq!(index.expansion_add(), 10);
         assert!(index.add(42, &first).is_ok());
+        assert!(index.change_expansion_add(12).is_ok());
+        assert_eq!(index.expansion_add(), 12);
         assert!(index.add(43, &second).is_ok());
         assert_eq!(index.size(), 2);
         println!(
@@ -422,8 +559,17 @@ mod tests {
             index.capacity(),
         );
 
+        assert!(index.change_expansion_search(10).is_ok());
+        assert_eq!(index.expansion_search(), 10);
         // Read back the tags
         let results = index.search(&first, 10).unwrap();
+        println!("{:?}", results);
+        assert_eq!(results.keys.len(), 2);
+
+        assert!(index.change_expansion_search(12).is_ok());
+        assert_eq!(index.expansion_search(), 12);
+        let results = index.search(&first, 10).unwrap();
+        println!("{:?}", results);
         assert_eq!(results.keys.len(), 2);
 
         // Validate serialization

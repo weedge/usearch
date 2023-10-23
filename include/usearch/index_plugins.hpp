@@ -41,11 +41,19 @@
 #endif
 
 #if USEARCH_USE_SIMSIMD
+// Propagate the `f16` settings
+#define SIMSIMD_NATIVE_F16 USEARCH_USE_NATIVE_F16
 #if defined(USEARCH_DEFINED_LINUX)
+#define SIMSIMD_TARGET_X86_AVX512 1
+#define SIMSIMD_TARGET_ARM_SVE 1
+#define SIMSIMD_TARGET_X86_AVX2 1
+#define SIMSIMD_TARGET_ARM_NEON 1
 #include <simsimd/simsimd.h>
 #elif defined(USEARCH_DEFINED_APPLE)
 #define SIMSIMD_TARGET_X86_AVX512 0
 #define SIMSIMD_TARGET_ARM_SVE 0
+#define SIMSIMD_TARGET_X86_AVX2 1
+#define SIMSIMD_TARGET_ARM_NEON 1
 #include <simsimd/simsimd.h>
 #endif
 #endif
@@ -128,16 +136,6 @@ enum class scalar_kind_t : std::uint8_t {
     i8_k,
 };
 
-enum class isa_kind_t {
-    auto_k,
-    neon_k,
-    sve_k,
-    avx2_k,
-    avx2f16_k,
-    avx512_k,
-    avx512f16_k,
-};
-
 enum class prefetching_kind_t {
     none_k,
     cpu_k,
@@ -192,95 +190,6 @@ template <typename at> inline at clamp(at v, at lo, at hi) noexcept {
 inline bool str_equals(char const* begin, std::size_t len, char const* other_begin) noexcept {
     std::size_t other_len = std::strlen(other_begin);
     return len == other_len && std::strncmp(begin, other_begin, len) == 0;
-}
-
-inline char const* isa_name(isa_kind_t isa_kind) noexcept {
-    switch (isa_kind) {
-    case isa_kind_t::auto_k: return "auto";
-    case isa_kind_t::neon_k: return "neon";
-    case isa_kind_t::sve_k: return "sve";
-    case isa_kind_t::avx2_k: return "avx2";
-    case isa_kind_t::avx512_k: return "avx512";
-    case isa_kind_t::avx2f16_k: return "avx2+f16";
-    case isa_kind_t::avx512f16_k: return "avx512+f16";
-    default: return "";
-    }
-}
-
-inline bool hardware_supports(isa_kind_t isa_kind) noexcept {
-
-    // On Linux Arm machines the `getauxval` can be queried to check
-    // if SVE extensions are available. Arm Neon has no separate capability check.
-#if defined(USEARCH_DEFINED_ARM) && defined(USEARCH_DEFINED_LINUX)
-    unsigned long capabilities = getauxval(AT_HWCAP);
-    switch (isa_kind) {
-    case isa_kind_t::neon_k: return true; // Must be supported on 64-bit Arm
-    case isa_kind_t::sve_k: return capabilities & HWCAP_SVE;
-    default: return false;
-    }
-#endif
-
-    // When compiling with GCC, one may use the "built-ins", including ones
-    // designed for CPU capability detection, but they are not fully compatible with Clang.
-    // So instead I've decided to add a pinch of inline assembly.
-#if defined(USEARCH_DEFINED_X86)
-    auto check_cpu_feature = [](std::uint64_t feature_mask, int function_id, int register_id) -> bool {
-        std::uint32_t eax, ebx, ecx, edx;
-        // Execute CPUID instruction and store results in eax, ebx, ecx, edx
-        // Setting %ecx to 0 as well
-        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(function_id), "c"(0));
-        std::uint32_t register_value;
-        switch (register_id) {
-        case 0: register_value = eax; break;
-        case 1: register_value = ebx; break;
-        case 2: register_value = ecx; break;
-        case 3: register_value = edx; break;
-        default: return false;
-        }
-
-        return (register_value & feature_mask) != 0;
-    };
-
-    // Check for AVX2 (Function ID 7, EBX register)
-    // https://github.com/llvm/llvm-project/blob/50598f0ff44f3a4e75706f8c53f3380fe7faa896/clang/lib/Headers/cpuid.h#L148
-    bool supports_avx2 = check_cpu_feature(1 << 5, 7, 1);
-
-    // Check for F16C (Function ID 1, ECX register)
-    // https://github.com/llvm/llvm-project/blob/50598f0ff44f3a4e75706f8c53f3380fe7faa896/clang/lib/Headers/cpuid.h#L107
-    bool supports_f16c = check_cpu_feature(1 << 29, 1, 2);
-
-    // Check for AVX512F (Function ID 7, EBX register)
-    // https://github.com/llvm/llvm-project/blob/50598f0ff44f3a4e75706f8c53f3380fe7faa896/clang/lib/Headers/cpuid.h#L155
-    bool supports_avx512f = check_cpu_feature(1 << 16, 7, 1);
-
-    // Check for AVX512FP16 (Function ID 7, EDX register)
-    // https://github.com/llvm/llvm-project/blob/50598f0ff44f3a4e75706f8c53f3380fe7faa896/clang/lib/Headers/cpuid.h#L198C9-L198C23
-    bool supports_avx512fp16 = check_cpu_feature(1 << 23, 7, 3);
-
-    switch (isa_kind) {
-    case isa_kind_t::avx2f16_k: return supports_avx2 && supports_f16c;
-    case isa_kind_t::avx512f16_k: return supports_avx512fp16 && supports_avx512f;
-    case isa_kind_t::avx2_k: return supports_avx2;
-    case isa_kind_t::avx512_k: return supports_avx512f;
-    default: return false;
-    }
-#endif
-
-    // On Apple we can expect Arm devices to support Neon extesions,
-    // and the x86 machines to support AVX2 extensions.
-#if defined(USEARCH_DEFINED_APPLE)
-    switch (isa_kind) {
-#if defined(USEARCH_DEFINED_ARM)
-    case isa_kind_t::neon_k: return true;
-#else
-    case isa_kind_t::avx2_k: return true;
-#endif
-    default: return false;
-    }
-#endif
-
-    (void)isa_kind;
-    return false;
 }
 
 inline std::size_t bits_per_scalar(scalar_kind_t scalar_kind) noexcept {
@@ -653,9 +562,7 @@ class aligned_allocator_gt {
     using size_type = std::size_t;
     using pointer = element_at*;
     using const_pointer = element_at const*;
-    template <typename other_element_at> struct rebind {
-        using other = aligned_allocator_gt<other_element_at>;
-    };
+    template <typename other_element_at> struct rebind { using other = aligned_allocator_gt<other_element_at>; };
 
     constexpr std::size_t alignment() const { return alignment_ak; }
 
@@ -716,7 +623,7 @@ class page_allocator_t {
  *          @b Thread-safe, @b except constructors and destructors.
  *
  *  Using this memory allocator won't affect your overall speed much, as that is not the bottleneck.
- *  However, it can drastically improve memory usage especcially for huge indexes of small vectors.
+ *  However, it can drastically improve memory usage especially for huge indexes of small vectors.
  */
 template <std::size_t alignment_ak = 1> class memory_mapping_allocator_gt {
 
@@ -1350,6 +1257,7 @@ enum class metric_punned_signature_t {
 /**
  *  @brief  Type-punned metric class, which unlike STL's `std::function` avoids any memory allocations.
  *          It also provides additional APIs to check, if SIMD hardware-acceleration is available.
+ *          Wraps the `simsimd_metric_punned_t`.
  */
 class metric_punned_t {
   public:
@@ -1358,15 +1266,19 @@ class metric_punned_t {
 
   private:
     using punned_arg_t = std::size_t;
-    using raw_ptr_t = result_t (*)(punned_arg_t, punned_arg_t, punned_arg_t, punned_arg_t);
-    raw_ptr_t raw_ptr_ = nullptr;
+    using punned_ptr_t = result_t (*)(std::size_t, std::size_t, std::size_t, std::size_t);
+
+    punned_ptr_t raw_ptr_ = nullptr;
     punned_arg_t raw_arg3_ = 0;
     punned_arg_t raw_arg4_ = 0;
 
     std::size_t dimensions_ = 0;
     metric_kind_t metric_kind_ = metric_kind_t::unknown_k;
     scalar_kind_t scalar_kind_ = scalar_kind_t::unknown_k;
-    isa_kind_t isa_kind_ = isa_kind_t::auto_k;
+
+#if USEARCH_USE_SIMSIMD
+    simsimd_capability_t isa_kind_ = simsimd_cap_serial_k;
+#endif
 
   public:
     /**
@@ -1386,8 +1298,14 @@ class metric_punned_t {
         metric_kind_t metric_kind = metric_kind_t::l2sq_k, //
         scalar_kind_t scalar_kind = scalar_kind_t::f32_k) noexcept
         : raw_arg3_(dimensions), raw_arg4_(dimensions), dimensions_(dimensions), metric_kind_(metric_kind),
-          scalar_kind_(scalar_kind), isa_kind_(isa_kind_t::auto_k) {
-        reset_();
+          scalar_kind_(scalar_kind) {
+
+#if USEARCH_USE_SIMSIMD
+        if (configure_with_simsimd())
+            return;
+#endif
+
+        configure_with_auto_vectorized();
     }
 
     inline metric_punned_t(                                                 //
@@ -1395,7 +1313,7 @@ class metric_punned_t {
         std::uintptr_t metric_uintptr, metric_punned_signature_t signature, //
         metric_kind_t metric_kind,                                          //
         scalar_kind_t scalar_kind) noexcept
-        : raw_ptr_(reinterpret_cast<raw_ptr_t>(metric_uintptr)), dimensions_(dimensions), metric_kind_(metric_kind),
+        : raw_ptr_(reinterpret_cast<punned_ptr_t>(metric_uintptr)), dimensions_(dimensions), metric_kind_(metric_kind),
           scalar_kind_(scalar_kind) {
 
         // We don't need to explicitly parse signature, as all of them are compatible.
@@ -1405,7 +1323,23 @@ class metric_punned_t {
     inline std::size_t dimensions() const noexcept { return dimensions_; }
     inline metric_kind_t metric_kind() const noexcept { return metric_kind_; }
     inline scalar_kind_t scalar_kind() const noexcept { return scalar_kind_; }
-    inline isa_kind_t isa_kind() const noexcept { return isa_kind_; }
+
+    inline char const* isa_name() const noexcept {
+#if USEARCH_USE_SIMSIMD
+        switch (isa_kind_) {
+        case simsimd_cap_serial_k: return "serial";
+        case simsimd_cap_arm_neon_k: return "neon";
+        case simsimd_cap_arm_sve_k: return "sve";
+        case simsimd_cap_x86_avx2_k: return "avx2";
+        case simsimd_cap_x86_avx512_k: return "avx512";
+        case simsimd_cap_x86_avx2fp16_k: return "avx2+f16";
+        case simsimd_cap_x86_avx512fp16_k: return "avx512+f16";
+        case simsimd_cap_x86_avx512vpopcntdq_k: return "avx512+popcnt";
+        default: return "unknown";
+        }
+#endif
+        return "serial";
+    }
 
     inline std::size_t bytes_per_vector() const noexcept {
         return divide_round_up<CHAR_BIT>(dimensions_ * bits_per_scalar(scalar_kind_));
@@ -1416,24 +1350,108 @@ class metric_punned_t {
     }
 
   private:
-    void reset_() noexcept {
+    bool configure_with_simsimd() noexcept {
+#if USEARCH_USE_SIMSIMD
+        simsimd_metric_kind_t kind = simsimd_metric_unknown_k;
+        simsimd_datatype_t datatype = simsimd_datatype_unknown_k;
+        simsimd_capability_t allowed = simsimd_cap_any_k;
         switch (metric_kind_) {
-        case metric_kind_t::ip_k: return reset_ip_metric_();
-        case metric_kind_t::cos_k: return reset_cos_metric_();
-        case metric_kind_t::l2sq_k: return reset_l2sq_metric_();
-        case metric_kind_t::pearson_k: return reset_pearson_metric_();
-        case metric_kind_t::haversine_k: return reset_haversine_metric_();
+        case metric_kind_t::ip_k: kind = simsimd_metric_ip_k; break;
+        case metric_kind_t::cos_k: kind = simsimd_metric_cos_k; break;
+        case metric_kind_t::l2sq_k: kind = simsimd_metric_l2sq_k; break;
+        case metric_kind_t::hamming_k: kind = simsimd_metric_hamming_k; break;
+        case metric_kind_t::jaccard_k: kind = simsimd_metric_jaccard_k; break;
+        default: break;
+        }
+        switch (scalar_kind_) {
+        case scalar_kind_t::f32_k: datatype = simsimd_datatype_f32_k; break;
+        case scalar_kind_t::f64_k: datatype = simsimd_datatype_f64_k; break;
+        case scalar_kind_t::f16_k: datatype = simsimd_datatype_f16_k; break;
+        case scalar_kind_t::i8_k: datatype = simsimd_datatype_i8_k; break;
+        case scalar_kind_t::b1x8_k: datatype = simsimd_datatype_b8_k; break;
+        default: break;
+        }
+        simsimd_metric_punned_t simd_metric = NULL;
+        simsimd_capability_t simd_kind = simsimd_cap_any_k;
+        simsimd_capability_t simd_caps = simsimd_capabilities();
+        simsimd_find_metric_punned(kind, datatype, simd_caps, allowed, &simd_metric, &simd_kind);
+        if (simd_metric == nullptr)
+            return false;
+
+        raw_ptr_ = (punned_ptr_t)simd_metric;
+        isa_kind_ = simd_kind;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void configure_with_auto_vectorized() noexcept {
+        switch (metric_kind_) {
+        case metric_kind_t::ip_k: {
+            switch (scalar_kind_) {
+            case scalar_kind_t::f32_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_ip_gt<f32_t>>; break;
+            case scalar_kind_t::f16_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_ip_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_ip_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::f64_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_ip_gt<f64_t>>; break;
+            default: raw_ptr_ = nullptr; break;
+            }
+            break;
+        }
+        case metric_kind_t::cos_k: {
+            switch (scalar_kind_) {
+            case scalar_kind_t::f32_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_cos_gt<f32_t>>; break;
+            case scalar_kind_t::f16_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_cos_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_cos_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::f64_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_cos_gt<f64_t>>; break;
+            default: raw_ptr_ = nullptr; break;
+            }
+            break;
+        }
+        case metric_kind_t::l2sq_k: {
+            switch (scalar_kind_) {
+            case scalar_kind_t::f32_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_l2sq_gt<f32_t>>; break;
+            case scalar_kind_t::f16_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_l2sq_gt<f16_t, f32_t>>; break;
+            case scalar_kind_t::i8_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_l2sq_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::f64_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_l2sq_gt<f64_t>>; break;
+            default: raw_ptr_ = nullptr; break;
+            }
+            break;
+        }
+        case metric_kind_t::pearson_k: {
+            switch (scalar_kind_) {
+            case scalar_kind_t::i8_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_pearson_gt<i8_t, f32_t>>; break;
+            case scalar_kind_t::f16_k:
+                raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_pearson_gt<f16_t, f32_t>>;
+                break;
+            case scalar_kind_t::f32_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_pearson_gt<f32_t>>; break;
+            case scalar_kind_t::f64_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_pearson_gt<f64_t>>; break;
+            default: raw_ptr_ = nullptr; break;
+            }
+            break;
+        }
+        case metric_kind_t::haversine_k: {
+            switch (scalar_kind_) {
+            case scalar_kind_t::f16_k:
+                raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_haversine_gt<f16_t, f32_t>>;
+                break;
+            case scalar_kind_t::f32_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_haversine_gt<f32_t>>; break;
+            case scalar_kind_t::f64_k: raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_haversine_gt<f64_t>>; break;
+            default: raw_ptr_ = nullptr; break;
+            }
+            break;
+        }
         case metric_kind_t::jaccard_k: // Equivalent to Tanimoto
         case metric_kind_t::tanimoto_k:
-            raw_ptr_ = &equidimensional_<metric_tanimoto_gt<b1x8_t>>,
+            raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_tanimoto_gt<b1x8_t>>,
             raw_arg3_ = raw_arg4_ = divide_round_up<CHAR_BIT>(dimensions_), scalar_kind_ = scalar_kind_t::b1x8_k;
             break;
         case metric_kind_t::hamming_k:
-            raw_ptr_ = &equidimensional_<metric_hamming_gt<b1x8_t>>,
+            raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_hamming_gt<b1x8_t>>,
             raw_arg3_ = raw_arg4_ = divide_round_up<CHAR_BIT>(dimensions_), scalar_kind_ = scalar_kind_t::b1x8_k;
             break;
         case metric_kind_t::sorensen_k:
-            raw_ptr_ = &equidimensional_<metric_sorensen_gt<b1x8_t>>,
+            raw_ptr_ = (punned_ptr_t)&equidimensional_<metric_sorensen_gt<b1x8_t>>,
             raw_arg3_ = raw_arg4_ = divide_round_up<CHAR_BIT>(dimensions_), scalar_kind_ = scalar_kind_t::b1x8_k;
             break;
         default: return;
@@ -1447,134 +1465,6 @@ class metric_punned_t {
         using scalar_t = typename typed_at::scalar_t;
         (void)b_dimensions;
         return typed_at{}((scalar_t const*)a, (scalar_t const*)b, a_dimensions);
-    }
-
-    template <typename scalar_at>
-    bool reset_if_(isa_kind_t isa, result_t (*function_ptr)(scalar_at, scalar_at, size_t),
-                   bool second_condition = true) noexcept {
-        raw_ptr_t punned_ptr = reinterpret_cast<raw_ptr_t>(function_ptr);
-        if (hardware_supports(isa) && second_condition) {
-            raw_ptr_ = punned_ptr;
-            isa_kind_ = isa;
-            return true;
-        } else
-            return false;
-    }
-
-    // clang-format off
-    void reset_ip_metric_f32_() noexcept {
-        #if USEARCH_USE_SIMSIMD
-        #if SIMSIMD_TARGET_ARM_NEON
-        if (reset_if_(isa_kind_t::neon_k, &simsimd_dot_f32x4_neon, dimensions_ % 4 == 0)) return;
-        #elif SIMSIMD_TARGET_ARM_SVE
-        if (reset_if_(isa_kind_t::sve_k, &simsimd_dot_f32_sve)) return;
-        #elif SIMSIMD_TARGET_X86_AVX2
-        if (reset_if_(isa_kind_t::avx2_k, &simsimd_dot_f32x4_avx2, dimensions_ % 4 == 0)) return;
-        #endif
-        #endif
-        raw_ptr_ = &equidimensional_<metric_ip_gt<f32_t>>;
-    }
-
-    void reset_cos_metric_f16_() noexcept {
-        #if USEARCH_USE_SIMSIMD
-        #if SIMSIMD_TARGET_X86_AVX512
-        if (reset_if_(isa_kind_t::avx512f16_k, &simsimd_cos_f16x16_avx512, dimensions_ % 16 == 0)) return;
-        #elif SIMSIMD_TARGET_X86_AVX2
-        if (reset_if_(isa_kind_t::avx2f16_k, &simsimd_cos_f16x8_avx2, dimensions_ % 8 == 0)) return;
-        #elif SIMSIMD_TARGET_ARM_NEON
-        if (reset_if_(isa_kind_t::neon_k, &simsimd_cos_f16x4_neon, dimensions_ % 4 == 0)) return;
-        #elif SIMSIMD_TARGET_ARM_SVE
-        if (reset_if_(isa_kind_t::sve_k, &simsimd_cos_f16_sve)) return;
-        #endif
-        #endif
-        raw_ptr_ = &equidimensional_<metric_cos_gt<f16_t, f32_t>>;
-    }
-
-    void reset_ip_metric_f16_() noexcept {
-        #if USEARCH_USE_SIMSIMD
-        #if SIMSIMD_TARGET_X86_AVX512
-        if (reset_if_(isa_kind_t::avx512f16_k, &simsimd_dot_f16x16_avx512, dimensions_ % 16 == 0)) return;
-        #elif SIMSIMD_TARGET_X86_AVX2
-        if (reset_if_(isa_kind_t::avx2f16_k, &simsimd_dot_f16x8_avx2, dimensions_ % 8 == 0)) return;
-        #elif SIMSIMD_TARGET_ARM_NEON
-        if (reset_if_(isa_kind_t::neon_k, &simsimd_dot_f16x4_neon, dimensions_ % 4 == 0)) return;
-        #endif
-        #endif
-        raw_ptr_ = &equidimensional_<metric_cos_gt<f16_t, f32_t>>;
-    }
-
-    void reset_l2sq_metric_f16_() noexcept {
-        #if USEARCH_USE_SIMSIMD
-        #if SIMSIMD_TARGET_X86_AVX512
-        if (reset_if_(isa_kind_t::avx512f16_k, &simsimd_l2sq_f16x16_avx512, dimensions_ % 16 == 0)) return;
-        #elif SIMSIMD_TARGET_X86_AVX2
-        if (reset_if_(isa_kind_t::avx2f16_k, &simsimd_l2sq_f16x8_avx2, dimensions_ % 8 == 0)) return;
-        #elif SIMSIMD_TARGET_ARM_SVE
-        if (reset_if_(isa_kind_t::sve_k, &simsimd_l2sq_f16_sve)) return;
-        #endif
-        #endif
-        raw_ptr_ = &equidimensional_<metric_l2sq_gt<f16_t, f32_t>>;
-    }
-
-    void reset_cos_metric_i8_() noexcept {
-        #if USEARCH_USE_SIMSIMD
-        #if SIMSIMD_TARGET_ARM_NEON
-        if (reset_if_(isa_kind_t::neon_k, &simsimd_cos_i8x16_neon, dimensions_ % 16 == 0)) return;
-        #elif SIMSIMD_TARGET_X86_AVX2
-        if (reset_if_(isa_kind_t::avx2_k, &simsimd_cos_i8x32_avx2, dimensions_ % 32 == 0)) return;
-        #endif
-        #endif
-        raw_ptr_ = &equidimensional_<cos_i8_t>;
-    }
-    // clang-format on
-
-    void reset_ip_metric_() noexcept {
-        switch (scalar_kind_) { // The two most common numeric types for the most common metric have optimized versions
-        case scalar_kind_t::f32_k: return reset_ip_metric_f32_();
-        case scalar_kind_t::f16_k: return reset_ip_metric_f16_();
-        case scalar_kind_t::i8_k: return reset_cos_metric_i8_();
-        case scalar_kind_t::f64_k: raw_ptr_ = &equidimensional_<metric_ip_gt<f64_t>>; break;
-        default: return;
-        }
-    }
-
-    void reset_l2sq_metric_() noexcept {
-        switch (scalar_kind_) {
-        case scalar_kind_t::i8_k: raw_ptr_ = &equidimensional_<l2sq_i8_t>; break;
-        case scalar_kind_t::f16_k: return reset_l2sq_metric_f16_();
-        case scalar_kind_t::f32_k: raw_ptr_ = &equidimensional_<metric_l2sq_gt<f32_t>>; break;
-        case scalar_kind_t::f64_k: raw_ptr_ = &equidimensional_<metric_l2sq_gt<f64_t>>; break;
-        default: return;
-        }
-    }
-
-    void reset_cos_metric_() noexcept {
-        switch (scalar_kind_) {
-        case scalar_kind_t::i8_k: return reset_cos_metric_i8_();
-        case scalar_kind_t::f16_k: return reset_cos_metric_f16_();
-        case scalar_kind_t::f32_k: raw_ptr_ = &equidimensional_<metric_cos_gt<f32_t>>; break;
-        case scalar_kind_t::f64_k: raw_ptr_ = &equidimensional_<metric_cos_gt<f64_t>>; break;
-        default: return;
-        }
-    }
-
-    void reset_haversine_metric_() noexcept {
-        switch (scalar_kind_) {
-        case scalar_kind_t::f16_k: raw_ptr_ = &equidimensional_<metric_haversine_gt<f16_t, f32_t>>; break;
-        case scalar_kind_t::f32_k: raw_ptr_ = &equidimensional_<metric_haversine_gt<f32_t>>; break;
-        case scalar_kind_t::f64_k: raw_ptr_ = &equidimensional_<metric_haversine_gt<f64_t>>; break;
-        default: return;
-        }
-    }
-
-    void reset_pearson_metric_() noexcept {
-        switch (scalar_kind_) {
-        case scalar_kind_t::i8_k: raw_ptr_ = &equidimensional_<metric_pearson_gt<i8_t, f32_t>>; break;
-        case scalar_kind_t::f16_k: raw_ptr_ = &equidimensional_<metric_pearson_gt<f16_t, f32_t>>; break;
-        case scalar_kind_t::f32_k: raw_ptr_ = &equidimensional_<metric_pearson_gt<f32_t>>; break;
-        case scalar_kind_t::f64_k: raw_ptr_ = &equidimensional_<metric_pearson_gt<f64_t>>; break;
-        default: return;
-        }
     }
 };
 
@@ -1732,6 +1622,7 @@ class exact_search_t {
  *  @section Layout
  *
  *  For every slot we store 2 extra bits for 3 possible states: empty, populated, or deleted.
+ *  With linear probing the hashes at the end of the populated region will spill into its first half.
  */
 template <typename element_at, typename hash_at, typename equals_at, typename allocator_at = std::allocator<char>>
 class flat_hash_multi_set_gt {
@@ -1950,19 +1841,16 @@ class flat_hash_multi_set_gt {
         using pointer = element_t*;
         using reference = element_t&;
 
-        equal_iterator_gt(std::size_t index, flat_hash_multi_set_gt* parent, const query_at& query,
-                          const equals_t& equals)
+        equal_iterator_gt(std::size_t index, flat_hash_multi_set_gt* parent, query_at const& query,
+                          equals_t const& equals)
             : index_(index), parent_(parent), query_(query), equals_(equals) {}
 
         // Pre-increment
         equal_iterator_gt& operator++() {
             do {
-                ++index_;
-                if (index_ >= parent_->capacity_slots_) {
-                    break;
-                }
-            } while (!equals_(parent_->slot_ref(index_).element, query_) ||
-                     !(parent_->slot_ref(index_).header.populated & parent_->slot_ref(index_).mask));
+                index_ = (index_ + 1) & (parent_->capacity_slots_ - 1);
+            } while (!equals_(parent_->slot_ref(index_).element, query_) &&
+                     (parent_->slot_ref(index_).header.populated & parent_->slot_ref(index_).mask));
             return *this;
         }
 
@@ -1986,6 +1874,12 @@ class flat_hash_multi_set_gt {
         equals_t equals_; // Store the equals functor
     };
 
+    /**
+     *  @brief  Returns an iterator range of all elements matching the given query.
+     *
+     *  Technically, the second iterator points to the first empty slot after a
+     *  range of equal values and non-equal values with similar hashes.
+     */
     template <typename query_at>
     std::pair<equal_iterator_gt<query_at>, equal_iterator_gt<query_at>>
     equal_range(query_at const& query) const noexcept {
@@ -1998,28 +1892,41 @@ class flat_hash_multi_set_gt {
 
         hash_t hasher;
         std::size_t hash_value = hasher(query);
-        std::size_t slot_index = hash_value & (capacity_slots_ - 1);
-        std::size_t const start_index = slot_index;
-        std::size_t first_equal_index = capacity_slots_;
+        std::size_t first_equal_index = hash_value & (capacity_slots_ - 1);
+        std::size_t const start_index = first_equal_index;
 
         // Linear probing to find the first equal element
         do {
-            slot_ref_t slot = slot_ref(slot_index);
+            slot_ref_t slot = slot_ref(first_equal_index);
             if (slot.header.populated & ~slot.header.deleted & slot.mask) {
-                if (equals(slot.element, query)) {
-                    first_equal_index = slot_index;
+                if (equals(slot.element, query))
                     break;
-                }
             }
             // Stop if we find an empty slot
             else if (~slot.header.populated & slot.mask)
-                break;
+                return {end, end};
 
             // Move to the next slot
-            slot_index = (slot_index + 1) & (capacity_slots_ - 1);
-        } while (slot_index != start_index);
+            first_equal_index = (first_equal_index + 1) & (capacity_slots_ - 1);
+        } while (first_equal_index != start_index);
 
-        return {equal_iterator_gt<query_at>(first_equal_index, this_ptr, query, equals), end};
+        // If no matching element was found, return end iterators
+        if (first_equal_index == capacity_slots_)
+            return {end, end};
+
+        // Start from the first matching element and find the end of the populated range
+        std::size_t first_empty_index = first_equal_index;
+        do {
+            first_empty_index = (first_empty_index + 1) & (capacity_slots_ - 1);
+            slot_ref_t slot = slot_ref(first_empty_index);
+
+            // If we find an empty slot, this is our end
+            if (~slot.header.populated & slot.mask)
+                break;
+        } while (first_empty_index != start_index);
+
+        return {equal_iterator_gt<query_at>(first_equal_index, this_ptr, query, equals),
+                equal_iterator_gt<query_at>(first_empty_index, this_ptr, query, equals)};
     }
 
     template <typename similar_at> bool pop_first(similar_at&& query, element_t& popped_value) noexcept {
@@ -2065,7 +1972,7 @@ class flat_hash_multi_set_gt {
         equals_t equals;
         std::size_t hash_value = hasher(query);
         std::size_t slot_index = hash_value & (capacity_slots_ - 1); // Assuming capacity_slots_ is a power of 2
-        std::size_t start_index = slot_index;                        // To detect loop in probing
+        std::size_t const start_index = slot_index;                  // To detect loop in probing
         std::size_t count = 0;                                       // Count of elements removed
 
         // Linear probing to find all matches
